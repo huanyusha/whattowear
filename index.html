@@ -15,6 +15,9 @@
     .brand { font-size:clamp(22px,3vw,37px); font-weight:800; letter-spacing:-.08em; line-height:1; }
     .brand small { display:block; margin-top:8px; font-size:10px; font-weight:400; letter-spacing:.16em; }
     .date { font-size:11px; text-align:right; line-height:1.7; color:var(--muted); letter-spacing:.08em; }
+    .sync-button { margin-top:7px; padding:0; border:0; background:transparent; color:var(--ink); font-size:10px; letter-spacing:.08em; text-decoration:underline; }
+    .sync-dot { display:inline-block; width:6px; height:6px; margin-right:5px; border-radius:50%; background:#aaa; }
+    .sync-dot.online { background:#74a319; }
     .weather { display:grid; grid-template-columns:1.05fr .95fr; min-height:360px; border-bottom:1px solid var(--ink); }
     .weather-main { padding:45px 45px 45px 0; border-right:1px solid var(--line); display:flex; flex-direction:column; justify-content:space-between; }
     .eyebrow, .section-label { font-size:10px; letter-spacing:.17em; text-transform:uppercase; color:var(--muted); }
@@ -82,7 +85,7 @@
 </head>
 <body>
   <main class="page">
-    <header><div class="brand">WHAT TO WEAR<small>PERSONAL DIGITAL WARDROBE</small></div><div class="date" id="date"></div></header>
+    <header><div class="brand">WHAT TO WEAR<small>PERSONAL DIGITAL WARDROBE</small></div><div class="date" id="date"><button class="sync-button" type="button" onclick="openAuthDialog()"><span class="sync-dot" id="syncDot"></span><span id="syncText">本机衣橱</span></button></div></header>
     <section class="weather">
       <div class="weather-main"><div><div class="eyebrow">TODAY'S WEATHER</div><div class="temperature" id="temperature">--°</div><div class="weather-desc" id="condition">正在获取天气</div></div><div class="place" id="place">定位中…</div></div>
       <div class="weather-tip"><div><div class="eyebrow">EDITOR'S WEATHER NOTE</div><h1 id="outfit">正在为你准备今日的穿衣建议。</h1></div><p class="tip-note" id="tip">允许位置权限可获得更准确的本地天气；若不可用，将显示上海天气。</p></div>
@@ -99,7 +102,13 @@
     <button class="submit" type="submit">保存至衣橱</button>
   </form></dialog>
   <dialog id="detailDialog"><div class="modal-head"><h2>衣物详情</h2><button class="close" type="button" onclick="detailDialog.close()">×</button></div><div id="detailBody"></div></dialog>
+  <dialog id="authDialog"><div class="modal-head"><h2>云端衣橱同步</h2><button class="close" type="button" onclick="authDialog.close()">×</button></div><form id="authForm">
+    <p class="tip-note" style="margin:0 0 22px;max-width:none">在手机与电脑登录同一邮箱账号后，衣物资料和图片会自动实时同步。</p>
+    <div class="fields"><label>邮箱<input id="authEmail" type="email" required placeholder="name@example.com"></label><label>密码<input id="authPassword" type="password" required minlength="6" placeholder="至少 6 位"></label></div>
+    <button class="submit" id="authSubmit" type="submit">登录云端衣橱</button><button class="mini-btn" id="signupButton" type="button" style="margin-top:16px">没有账号？创建账号</button><button class="mini-btn" id="signoutButton" type="button" style="display:none;margin-top:16px">退出当前账号</button>
+  </form></dialog>
 
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script>
     // 衣物数据以 Base64 图片及字段一起保存，完全在本机浏览器内运行。
     // 五个主衣橱分区；上装与下装保留 ZARA 商品逻辑的细分类。
@@ -114,11 +123,18 @@
     const storageKey = 'what-to-wear-items-v1';
     let items = JSON.parse(localStorage.getItem(storageKey) || '[]');
     let pendingImage = '';
+    // Supabase 公开客户端配置：权限由数据库的 RLS 策略和登录用户控制。
+    const supabaseUrl = 'https://wronnonmxfctmdslvbvj.supabase.co';
+    const supabaseKey = 'sb_publishable_eSqLnAMUw0WJA2FX323RCA_yFr8exk8';
+    const supabaseClient = window.supabase?.createClient(supabaseUrl, supabaseKey);
+    let currentUser = null;
+    let realtimeChannel = null;
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
     $('date').innerHTML = new Intl.DateTimeFormat('zh-CN',{weekday:'long',year:'numeric',month:'long',day:'numeric'}).format(new Date()).replaceAll('年','年 ').replaceAll('月','月 ');
 
     function save() { localStorage.setItem(storageKey, JSON.stringify(items)); }
+    function setSyncStatus(text, online=false) { $('syncText').textContent=text; $('syncDot').classList.toggle('online',online); }
     function render() {
       $('categories').innerHTML = departments.map(dept => {
         const departmentCount = items.filter(x => dept.subs.includes(x.category)).length;
@@ -134,16 +150,23 @@
     function setFilter(department, category) { activeFilters[department] = category; render(); }
     function openAddForDepartment(name) { const dept=departments.find(d=>d.name===name); const active=activeFilters[name] || '全部'; const options=active==='全部' ? dept.subs : [active]; openAdd(options); }
     function openAdd(options) { $('itemForm').reset(); pendingImage=''; $('preview').style.display='none'; $('uploadText').style.display='block'; $('categoryInput').innerHTML=options.map(category=>`<option value="${category}">${category}</option>`).join(''); $('formTitle').textContent=options.length===1 ? `添加 · ${options[0]}` : '添加衣物'; $('itemDialog').showModal(); }
-    function removeItem(id) { if (confirm('确定从衣橱中删除这件衣物吗？')) { items=items.filter(x=>x.id!==id); save(); render(); } }
+    async function removeItem(id) { if (!confirm('确定从衣橱中删除这件衣物吗？')) return; const item=items.find(x=>x.id===id); items=items.filter(x=>x.id!==id); save(); render(); if (currentUser && supabaseClient && item?.cloudPath) { const {error}=await supabaseClient.from('wardrobe_items').delete().eq('id',id); if (error) { alert('云端删除失败：'+error.message); await loadCloudItems(); return; } await supabaseClient.storage.from('wardrobe-images').remove([item.cloudPath]); } }
     function showDetail(id) { const x=items.find(i=>i.id===id); if (!x) return; $('detailBody').innerHTML=`<img class="detail-image" src="${x.image}" alt="${esc(x.name)}"><div class="detail-content"><h3>${esc(x.name)}</h3><dl class="details"><div><dt>分类</dt><dd>${esc(x.category)}</dd></div><div><dt>颜色</dt><dd>${esc(x.color)}</dd></div><div><dt>季节</dt><dd>${esc(x.season)}</dd></div><div><dt>风格</dt><dd>${esc(x.style)}</dd></div><div><dt>购入价格</dt><dd>¥ ${esc(x.price)}</dd></div><div><dt>穿搭场景</dt><dd>${esc(x.occasion)}</dd></div></dl></div>`; $('detailDialog').showModal(); }
     // 上传时压缩图片，减少 LocalStorage 配额占用。
     $('imageInput').addEventListener('change', e => { const file=e.target.files[0]; if (!file) return; const reader=new FileReader(); reader.onload=ev=>{ const img=new Image(); img.onload=()=>{ const max=900, ratio=Math.min(1,max/Math.max(img.width,img.height)); const canvas=document.createElement('canvas'); canvas.width=img.width*ratio; canvas.height=img.height*ratio; canvas.getContext('2d').drawImage(img,0,0,canvas.width,canvas.height); pendingImage=canvas.toDataURL('image/jpeg',.82); $('preview').src=pendingImage; $('preview').style.display='block'; $('uploadText').style.display='none'; }; img.src=ev.target.result; }; reader.readAsDataURL(file); });
-    $('itemForm').addEventListener('submit', e => { e.preventDefault(); if (!pendingImage) return alert('请先选择服装图片。'); const d=new FormData(e.currentTarget); items.unshift({ id:Date.now().toString(), category:$('categoryInput').value, image:pendingImage, name:d.get('name'), color:d.get('color'), season:d.get('season'), style:d.get('style'), price:d.get('price'), occasion:d.get('occasion') }); try { save(); } catch { items.shift(); return alert('浏览器存储空间不足，请上传更小的图片或删除部分衣物。'); } $('itemDialog').close(); render(); });
+    $('itemForm').addEventListener('submit', async e => { e.preventDefault(); if (!pendingImage) return alert('请先选择服装图片。'); const d=new FormData(e.currentTarget), id=crypto.randomUUID(), item={ id, category:$('categoryInput').value, image:pendingImage, name:d.get('name'), color:d.get('color'), season:d.get('season'), style:d.get('style'), price:d.get('price'), occasion:d.get('occasion') }; items.unshift(item); try { save(); } catch { items.shift(); return alert('浏览器存储空间不足，请上传更小的图片或删除部分衣物。'); } $('itemDialog').close(); render(); if (currentUser && supabaseClient) { try { const cloudPath=`${currentUser.id}/${id}.jpg`; const blob=await (await fetch(pendingImage)).blob(); const upload=await supabaseClient.storage.from('wardrobe-images').upload(cloudPath,blob,{contentType:'image/jpeg'}); if (upload.error) throw upload.error; const imageUrl=supabaseClient.storage.from('wardrobe-images').getPublicUrl(cloudPath).data.publicUrl; const insert=await supabaseClient.from('wardrobe_items').insert({id,user_id:currentUser.id,category:item.category,image_url:imageUrl,cloud_path:cloudPath,name:item.name,color:item.color,season:item.season,style:item.style,price:Number(item.price),occasion:item.occasion}); if (insert.error) throw insert.error; item.image=imageUrl; item.cloudPath=cloudPath; save(); render(); } catch (err) { alert('已暂存至本机，但云端同步失败：'+err.message); } } });
+    function openAuthDialog() { $('authForm').reset(); const logged=!!currentUser; $('authSubmit').style.display=logged?'none':'block'; $('signupButton').style.display=logged?'none':'inline-block'; $('signoutButton').style.display=logged?'inline-block':'none'; $('authDialog').showModal(); }
+    async function loadCloudItems() { if (!currentUser || !supabaseClient) return; const {data,error}=await supabaseClient.from('wardrobe_items').select('*').eq('user_id',currentUser.id).order('created_at',{ascending:false}); if (error) { setSyncStatus('云端设置未完成'); return; } items=data.map(x=>({id:x.id,category:x.category,image:x.image_url,cloudPath:x.cloud_path,name:x.name,color:x.color,season:x.season,style:x.style,price:x.price,occasion:x.occasion})); save(); render(); setSyncStatus('云端已同步',true); }
+    async function connectCloud() { if (!supabaseClient) { setSyncStatus('云端加载失败'); return; } const {data:{user}}=await supabaseClient.auth.getUser(); currentUser=user; if (!user) { setSyncStatus('登录以同步'); return; } setSyncStatus('正在同步…',true); await loadCloudItems(); if (realtimeChannel) supabaseClient.removeChannel(realtimeChannel); realtimeChannel=supabaseClient.channel(`wardrobe-${user.id}`).on('postgres_changes',{event:'*',schema:'public',table:'wardrobe_items',filter:`user_id=eq.${user.id}`},()=>loadCloudItems()).subscribe(); }
+    $('authForm').addEventListener('submit',async e=>{ e.preventDefault(); if (!supabaseClient) return alert('云端服务加载失败，请检查网络。'); const result=await supabaseClient.auth.signInWithPassword({email:$('authEmail').value,password:$('authPassword').value}); if(result.error) return alert('登录失败：'+result.error.message); currentUser=result.data.user; $('authDialog').close(); await connectCloud(); });
+    $('signupButton').addEventListener('click',async()=>{ if (!supabaseClient) return alert('云端服务加载失败，请检查网络。'); const email=$('authEmail').value,password=$('authPassword').value; if(!email||password.length<6) return alert('请输入邮箱和至少 6 位密码。'); const result=await supabaseClient.auth.signUp({email,password}); if(result.error) return alert('创建失败：'+result.error.message); alert('账号已创建。若收到验证邮件，请先完成验证，再用同一邮箱密码登录其他设备。'); });
+    $('signoutButton').addEventListener('click',async()=>{ await supabaseClient?.auth.signOut(); currentUser=null; if(realtimeChannel) supabaseClient.removeChannel(realtimeChannel); $('authDialog').close(); setSyncStatus('登录以同步'); });
     const weatherText={0:'晴朗',1:'大致晴朗',2:'多云',3:'阴天',45:'有雾',48:'雾凇',51:'毛毛雨',53:'毛毛雨',55:'毛毛雨',61:'小雨',63:'中雨',65:'大雨',71:'小雪',73:'中雪',75:'大雪',80:'阵雨',81:'阵雨',82:'强阵雨',95:'雷雨'};
     function recommendation(temp, code) { const wet=[51,53,55,61,63,65,80,81,82,95].includes(code); let s=temp>=28?'轻薄 T 恤或背心，搭配短裤 / 半裙':temp>=21?'短袖上衣或连衣裙，备一件薄衬衫':temp>=15?'针织或衬衫叠穿，配长裤':temp>=8?'外套搭配针织内搭与长裤':'厚外套、保暖针织和围巾不可少'; return wet ? `${s}；今天有雨，别忘了防水鞋与雨具。` : `${s}。`; }
     async function fetchWeather(lat=39.9042, lon=116.4074, label='北京') { try { const url=`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,weather_code&timezone=auto`; const res=await fetch(url); if(!res.ok) throw Error(); const data=await res.json(), cur=data.current, condition=weatherText[cur.weather_code]||'天气变化中'; $('temperature').textContent=`${Math.round(cur.temperature_2m)}°`; $('condition').textContent=condition; $('place').textContent=`${label} · 实时更新`; $('outfit').textContent=recommendation(cur.temperature_2m,cur.weather_code); $('tip').textContent=`现在 ${condition}，体感会随风力与湿度变化。根据衣橱中已有单品，自由组合出你的今日造型。`; } catch { $('temperature').textContent='--°'; $('condition').textContent='暂时无法连接天气服务'; $('place').textContent=label; $('outfit').textContent='天气服务暂不可用时，也可以先从衣橱里挑一件让你感觉自在的衣物。'; $('tip').textContent='请检查网络连接后刷新页面。'; } }
     if (navigator.geolocation) navigator.geolocation.getCurrentPosition(p=>fetchWeather(p.coords.latitude,p.coords.longitude,'当前位置'),()=>fetchWeather(39.9042,116.4074,'北京'),{timeout:7000}); else fetchWeather(39.9042,116.4074,'北京');
     render();
+    connectCloud();
   </script>
 </body>
 </html>
